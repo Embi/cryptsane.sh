@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+# https://github.com/Embi/cryptsane.sh/blob/main/cryptsane-docker
+# Copyright (c) 2025 Embi
+# Licensed under the MIT License.
+
+USER_GNUPGHOME=${GNUPGHOME:-$HOME/.gnupg}
+
+# - Privileged mode is used to be able to access vault devices.
+# - Pcscd socket (/var/run/pcscd/pcscd.comm) is mounted to be able 
+#   to access yubikey.
+docker run --rm -it --privileged \
+  -v "$USER_GNUPGHOME":/app/.gnupg \
+  -v /var/run/pcscd/pcscd.comm:/var/run/pcscd/pcscd.comm \
+  -e GNUPGHOME="/app/.gnupg" \
+  -e CRYPTSANE_KEY_TYPE="${CRYPTSANE_KEY_TYPE}" \
+  -e CRYPTSANE_SUBKEY_EXPIRATION="${CRYPTSANE_SUBKEY_EXPIRATION}" \
+  -e CRYPTSANE_VAULT_FS="${CRYPTSANE_VAULT_FS}" \
+  -e CRYPTSANE_DOCKER="true" \
+  cryptsane "$@"

@@ -1,0 +1,1265 @@
+#!/usr/bin/env bash
+
+# https://github.com/Embi/cryptsane.sh/blob/main/cryptsane
+# Copyright (c) 2025 Embi
+# Licensed under the MIT License.
+
+set -o errtrace
+set -o nounset
+set -o pipefail
+export LC_ALL="C"
+umask 077
+
+# CONFIGURATION:
+#
+# All default values are taken from https://github.com/drduh/YubiKey-Guide
+# check the awesome guide for more info.
+declare -r \
+  KEY_TYPE="${CRYPTSANE_KEY_TYPE:-rsa4096}" \
+  SUBKEY_EXPIRATION="${CRYPTSANE_SUBKEY_EXPIRATION:-2y}" \
+  VAULT_FS="${CRYPTSANE_VAULT_FS:-ext2}" \
+  CRYPTSANE_DOCKER="${CRYPTSANE_DOCKER:-false}" \
+  YK_DEFAULT_ADMIN_PIN="12345678" \
+  YK_DEFAULT_USER_PIN="123456" 
+
+declare  \
+  PRIMARY_UID="" \
+  OTHER_UIDS="" \
+  KEYID="" \
+  CRYPTSANE_MODE="" \
+  TMP_GNUPGHOME="" \
+  VAULT_DEVICE="" \
+  VAULT_MOUNTDIR="" \
+  DETECTED_VAULT_DEVICES="" \
+  YUBIKEY="" \
+  PUBLIC_VAULT_MOUNT="" \
+  SECRET_VAULT_MOUNT="" \
+  LOGFILE=$(mktemp -t "cryptpi-$(date +%Y-%m-%d)-XXXXXXXXXX") \
+  GNUPGHOME=${GNUPGHOME:-$HOME/.gnupg}
+
+declare -A CRYPTSANE_FLAGS
+CRYPTSANE_FLAGS["private"]=0
+
+export GNUPGHOME VAULT_FS VAULT_MOUNTDIR GUM_CHOOSE_HEADER GUM_FILE_HEADER LOGFILE
+
+# Taken from https://raw.githubusercontent.com/drduh/config/master/gpg.conf
+readonly HARDENED_GPG_CONF="
+personal-cipher-preferences AES256 AES192 AES
+personal-digest-preferences SHA512 SHA384 SHA256
+personal-compress-preferences ZLIB BZIP2 ZIP Uncompressed
+default-preference-list SHA512 SHA384 SHA256 AES256 AES192 AES ZLIB BZIP2 ZIP Uncompressed
+cert-digest-algo SHA512
+s2k-digest-algo SHA512
+s2k-cipher-algo AES256
+charset utf-8
+no-comments
+no-emit-version
+no-greeting
+keyid-format 0xlong
+list-options show-uid-validity
+verify-options show-uid-validity
+with-fingerprint
+require-cross-certification
+no-symkey-cache
+use-agent
+armor
+throw-keyids
+"
+
+show_cli_help() {
+  local tool_filename="cryptsane"
+  [[ $CRYPTSANE_DOCKER == "true" ]] && tool_filename="cryptsane-docker"
+  printf '%s\n' "\
+Usage: $tool_filename [OPTIONS]
+
+Description:
+  Cryptsane is a TUI tool for managing OpenPGP/GnuPG/YubiKey madness. 
+  The tools allows you to:
+  - Create an OpenPGP Identity (key pair + subkeys + UIDs).
+  - Create a Vault (a USB block device with one LUKS-encrypted and one unencrypted
+    partition)
+  - Export an OpenPGP Identity to a Vault.
+  - Import an OpenPGP Identity from a Vault
+  - Move subkeys to a YubiKey.
+  - Rotate subkeys (revoke existing and generate new ones)
+  - Some other usefull stuff
+
+Options:
+  -h, --help       Show this help message and exit.
+  -p, --private    Run in private mode (root privileges required).
+
+Examples:
+  $tool_filename 
+  $tool_filename -p
+"
+}
+
+function log_error {
+  # Log error to both stderr and LOGFILE
+  local error_message=$1
+  gum log --level error "$error_message"
+  gum log -t rfc822 -o "$LOGFILE" --level error "$error_message"
+}
+
+function log_info {
+  # Log info to both stdout and LOGFILE
+  local info_message=$1
+  gum log --level info "$info_message"
+  gum log -t rfc822 -o "$LOGFILE" --level info "$info_message"
+}
+
+function show_logs {
+  less "$LOGFILE"
+}
+
+function init_gnupg_home {
+  # Initialize GNUPGHOME:
+  # Take users GNUPGHOME if run in user mode or create a temporary 
+  # directory if run in private mode.
+  if [[ "$CRYPTSANE_MODE" = "user" ]]; then
+    log_info "Using user's GNUPGHOME ($GNUPGHOME)..."
+  elif [[ "$CRYPTSANE_MODE" = "private" ]]; then
+    TMP_GNUPGHOME=$(mktemp -d -t "gnupg-$(date +%Y-%m-%d)-XXXXXXXXXX")
+    GNUPGHOME=$TMP_GNUPGHOME
+    echo "$HARDENED_GPG_CONF" > "$GNUPGHOME/gpg.conf"
+    echo "disable-ccid" > "$GNUPGHOME/scdaemon.conf"
+    log_info "Using temporary GNUPGHOME ($GNUPGHOME)..."
+  else
+    log_error "Cryptsane mode is not specified..."
+    exit 1
+  fi
+}
+
+function remove_tmp_gnupg_home {
+  if [[ -n "$TMP_GNUPGHOME" ]]; then
+    log_info "Removing temporary GNUPGHOME ($TMP_GNUPGHOME)..."
+    rm -r "$TMP_GNUPGHOME"
+  fi
+}
+
+function check_identity {
+  if [[ -z "$PRIMARY_UID" ]]; then
+    log_error "No identity selected. Either create new identity, import one from vault or select existing one."
+    return 1
+  fi
+}
+
+function check_vault_unmounted {
+  # Check that no vault partitions are mounted
+  local detected_pub_mount detected_sec_mount
+  detected_pub_mount=$(lsblk -r -n -o "mountpoint" \
+    | grep vault-public \
+    | cut -d" " -f2 \
+  )
+  detected_sec_mount=$(lsblk -r -n -o "mountpoint" \
+    | grep vault-secret \
+    | cut -d" " -f2 \
+  )
+  if [[ -n "$detected_pub_mount" || -n "$detected_sec_mount" ]]; then
+    log_error "Detected some vault mounts. Unmount them before continuing..."
+    return 1
+  fi
+}
+
+function check_vault_mounted {
+  # Check that vault partitions are mounted
+  local detected_pub_mount detected_sec_mount pub_tmp_dir sec_tmp_dir \
+    detected_mountdir=""
+
+  # Try to auto-detect existing vault mount points
+  detected_pub_mount=$(lsblk -r -n -o "mountpoint" \
+    | grep vault-public \
+    | cut -d" " -f2 \
+  )
+  detected_sec_mount=$(lsblk -r -n -o "mountpoint" \
+    | grep vault-secret \
+    | cut -d" " -f2 \
+  ) 
+  pub_tmp_dir=$(echo "$detected_pub_mount" | cut -d'/' -f3)
+  sec_tmp_dir=$(echo "$detected_sec_mount" | cut -d'/' -f3)
+  if [[ "$CRYPTSANE_MODE" = "private" ]]; then
+    if [[ "$pub_tmp_dir" = "$sec_tmp_dir" && -n "$pub_tmp_dir" ]]; then
+      detected_mountdir="/tmp/$pub_tmp_dir"
+    fi
+  elif [[ "$CRYPTSANE_MODE" = "user" ]]; then
+    if [[ -n "$pub_tmp_dir" ]]; then
+      detected_mountdir="/tmp/$pub_tmp_dir"
+    fi
+  fi
+
+  if [[ -n "$VAULT_MOUNTDIR" && "$VAULT_MOUNTDIR" == "$detected_mountdir" ]]
+  then
+    PUBLIC_VAULT_MOUNT="$detected_pub_mount"
+    SECRET_VAULT_MOUNT="$detected_sec_mount"
+    return 0
+  elif [[ -n "$detected_pub_mount" || -n "$detected_sec_mount" ]]; then
+    log_error "Vault is not mounted properly... Unmount it and try again."
+    return 1
+  else 
+    log_error "Vault is not mounted..."
+    return 1
+  fi
+}
+
+function check_yubikey {
+  # Check that a YubiKey is accessible via ykman.
+  if ! ykman info &>> /dev/null; then
+    log_error "No YubiKey detected..."
+    return 1
+  fi
+}
+
+function check_yubikey_access {
+  # Check that a YubiKey is accessible via gpg.
+  if ! gpg --card-status &>> /dev/null; then
+    log_error "GPG unable to access YubiKey..."
+    return 1
+  fi
+}
+
+function detect_yubikey {
+  local yubikey_type yubikey_sn
+  {
+    ykman_info="$(ykman info)"
+    yubikey_type=$(echo "$ykman_info" | grep -E "Device type" | cut -d":" -f2)
+    yubikey_sn=$(echo "$ykman_info" | grep -E "Serial number" | cut -d":" -f2)
+    YUBIKEY="${yubikey_type:-None} (SN: ${yubikey_sn:- None})"
+  } &>> "$LOGFILE" 
+}
+
+function yk_info {
+  ykman info
+}
+
+function ask_secret {
+  # Ask user to provide a secret twice
+  local secret secret_type secret_again
+
+  secret_type="$1"
+  secret=$(gum input --placeholder="Type secret..." \
+    --password --prompt "$secret_type: ")
+  secret_again=$(gum input --placeholder="Type secret again..." \
+    --password --prompt "$secret_type: ")
+  if [[ "$secret" = "$secret_again" ]]; then
+    echo "$secret"
+  else
+    log_error "Secrets don't match..."
+    return 1
+  fi
+}
+
+function ask_secret_once {
+  # Ask user to provide a secret once
+  local secret_type secret
+  secret_type="$1"
+  secret=$(gum input --placeholder="Type secret..." \
+    --password --prompt "$secret_type: ")
+  echo "$secret"
+}
+
+function __repartition_vault_device {
+  # Create vault partitions on the selected block device
+  # This is a helper function for create_vault operation
+  local vault_device
+  vault_device="$1"
+  log_info "Repartitioning vault device ($vault_device)..."
+  {
+    wipefs --all "$vault_device" || return 1
+    dd if=/dev/urandom of="$vault_device" bs=10M count=10 || return 1
+    echo -e "g\nw" | fdisk "$vault_device" || return 1
+    echo -e "n\n\n\n+100M\nn\n\n\n\nw" | fdisk "$vault_device" || return 1
+  } &>> "$LOGFILE" 
+  log_info "Vault device repartitioned."
+}
+
+function __prepare_vault_secret_partition {
+  # Format end encrypt the secret vault partition
+  # This is a helper function for create_vault operation
+  local secret_vault_part vault_pass
+  #/dev/sdX1
+  secret_vault_part="${1}1"
+  log_info "Preparing secret vault partition ($secret_vault_part)..."
+  {
+    vault_pass=$2
+    echo "$vault_pass" | cryptsetup -q luksFormat "$secret_vault_part" || return 1
+    echo "$vault_pass" | cryptsetup -q luksOpen "$secret_vault_part" vault-secret || return 1
+    mkfs -t "$VAULT_FS" -L vault-secret /dev/mapper/vault-secret || return 1
+    cryptsetup luksClose vault-secret || return 1
+  } &>> "$LOGFILE" 
+  log_info "Secret vault partition prepared."
+}
+
+function __prepare_vault_public_partition {
+  # Format the public vault partition
+  # This is a helper function for create_vault operation
+  #/dev/sdX2
+  local public_vault_part="${1}2"
+  log_info "Preparing public vault partition ($public_vault_part)..."
+  {
+    mkfs -t "$VAULT_FS" -L vault-public "$public_vault_part" || return 1
+  } &>> "$LOGFILE" 
+  log_info "Public vault partition prepared."
+}
+
+
+function detect_vault_devices {
+  local detected_vault_pub_parts
+  if [[ $CRYPTSANE_DOCKER == true ]]; then
+    detected_vault_pub_parts=$(blkid \
+      | grep "vault-public" \
+      | awk -F: '{ print $1 }' \
+    )
+    if [[ -n $detected_vault_pub_parts ]]; then
+      DETECTED_VAULT_DEVICES=$(echo "$detected_vault_pub_parts" \
+        | xargs lsblk -r -n -o "pkname" \
+        | tr '\n' ' ' \
+      )
+    else
+      DETECTED_VAULT_DEVICES=""
+    fi
+  else
+    DETECTED_VAULT_DEVICES=$(lsblk -r -n -o "label,pkname" \
+      | grep vault-public \
+      | cut -d" " -f2 \
+    )
+  fi
+}
+
+function show_vault_info {
+  # Show info about dected/mounted vaults
+  detect_vault_devices
+  printf "\nDetected vault devices: %30s\nMounted vault device: %30s\nMount dir: %30s\n \n"\
+    "$DETECTED_VAULT_DEVICES" "$VAULT_DEVICE" "$VAULT_MOUNTDIR"
+}
+
+function __mount_public_vault {
+  # Mount unencrypted public-vault partition
+  # This is a helper function for mount_vault operation
+  local selected_vault_device=$1 use_sudo=""
+  if [[ $EUID -ne 0 ]]; then
+    log_info "Sudo is required to mount public vault..."
+    sudo -v
+    use_sudo="sudo"
+  fi
+  {
+    mkdir -p "$VAULT_MOUNTDIR/vault-public"
+    $use_sudo mount "/dev/${selected_vault_device}2" \
+      "$VAULT_MOUNTDIR/vault-public" || return 1
+  } &>> "$LOGFILE"
+}
+
+function __mount_secret_vault {
+  # Mount encrypted secret-vault partition
+  # This is a helper function for mount_vault operation
+  local selected_vault_device=$1 vault_pass
+  vault_pass=$(ask_secret_once "Vault password")
+  {
+    mkdir -p "$VAULT_MOUNTDIR/vault-secret"
+    echo "$vault_pass" | cryptsetup -q luksOpen \
+      "/dev/${selected_vault_device}1" vault-secret || return 1
+    mount /dev/mapper/vault-secret "$VAULT_MOUNTDIR/vault-secret" || return 1
+  } &>> "$LOGFILE"
+}
+
+function mount_vault {
+  # Mount vault device to a temp dir. Mount either both vault-secret and
+  # vault-public partitions for private mode, or only vault-public for user
+  # mode.
+  local selected_vault_device vault_pass mounted
+
+  check_vault_unmounted || return 1
+
+  GUM_CHOOSE_HEADER="Choose vault device:"
+  detect_vault_devices
+  selected_vault_device=$(gum choose $DETECTED_VAULT_DEVICES)
+  if [[ -z "$selected_vault_device" ]]; then
+    log_info "No vault device selected..."
+    return 1
+  fi
+  log_info "Mounting vault device: $selected_vault_device"
+
+  # Create vault mount directory
+  if [[ -z $VAULT_MOUNTDIR ]]; then
+    VAULT_MOUNTDIR=$(mktemp -d -t "vault-$(date +%Y-%m-%d)-XXXXXXXXXX")
+  fi
+
+  mounted=0
+  __mount_public_vault "$selected_vault_device"
+  mounted=$((mounted + $?))
+  if [[ "$CRYPTSANE_MODE" = "private" ]]; then
+    __mount_secret_vault "$selected_vault_device"
+    mounted=$((mounted + $?))
+  fi
+
+  if [[ $mounted -gt 0 ]]; then
+    log_error "Failed to mount vault..."
+    return 1
+  fi
+
+  PUBLIC_VAULT_MOUNT="$VAULT_MOUNTDIR/vault-public"
+  [[ "$CRYPTSANE_MODE" = "private" ]] && SECRET_VAULT_MOUNT="$VAULT_MOUNTDIR/vault-secret"
+  VAULT_DEVICE="$selected_vault_device"
+  log_info "Vault device $VAULT_DEVICE mounted to $VAULT_MOUNTDIR."
+}
+
+function __umount_secret_vault {
+  local detected_sec_mounts
+  detected_sec_mounts=$(lsblk -r -n -o "mountpoint" | grep vault-secret | cut -d" " -f2)
+  [[ -n "$detected_sec_mounts" ]] || return 0
+  log_info "Unmounting secret vault ($detected_sec_mounts)..."
+  {
+    for mountpoint in $detected_sec_mounts; do
+        umount "$mountpoint" || return 1
+    done
+    cryptsetup luksClose vault-secret || return 1
+    SECRET_VAULT_MOUNT=""
+  } &>> "$LOGFILE" 
+  log_info "Unmounted secret vault ($detected_sec_mounts)"
+}
+
+function __umount_public_vault {
+  local use_sudo="" detected_pub_mounts
+  detected_pub_mounts=$(lsblk -r -n -o "mountpoint" | grep vault-public | cut -d" " -f2)
+  [[ -n "$detected_pub_mounts" ]] || return 0 
+  log_info "Unmounting public vault ($detected_pub_mounts)..."
+
+  if [[ "$CRYPTSANE_MODE" = "user" && $EUID -ne 0 ]]; then
+    log_info "Sudo is required to unmount public vault..."
+    sudo -v
+    use_sudo="sudo"
+  fi
+  {
+    for mountpoint in $detected_pub_mounts; do
+        $use_sudo umount "$mountpoint" || return 1
+    done
+  } &>> "$LOGFILE" 
+  log_info "Unmounted public vault ($detected_pub_mounts)"
+}
+
+function umount_vault {
+  __umount_public_vault || return 1
+  if [[ "$CRYPTSANE_MODE" == "private" ]]; then
+    __umount_secret_vault || return 1
+  fi
+}
+
+function create_vault {
+  # Create vault from the selected block device
+  #vault is a usb flashdisk with two partitions: 1. Luks encrypted 2. unencrypted
+  #the 1st partition is used for exporting private kays
+  #the 2nd for public key (and potentialy other public-ish stuff like e.g. gpg.conf)
+  local usb_block_devices selected_block_device device_info vault_pass confirm_message
+  umount_vault
+  usb_block_devices=$(lsblk -r -d -n -o "path,subsystems" | awk '/scsi:usb/ {print $1}')
+  GUM_CHOOSE_HEADER="Choose block device:"
+  selected_block_device=$(gum choose $usb_block_devices)
+  device_info=$(lsblk -r -d -n -o "path,size" | grep "$selected_block_device")
+  vault_pass=$(ask_secret "Create vault password")
+  confirm_message="Make $device_info a vault? This will wipe the device."
+  if gum confirm --default "$confirm_message"; then
+    log_info "creating vault from $selected_block_device block device"
+    gum spin --title "Repartitioning..." \
+      -- bash -c "__repartition_vault_device $selected_block_device" \
+      || return 1
+    gum spin --title "Preparing vault-secret partition..." \
+      -- bash -c "__prepare_vault_secret_partition $selected_block_device $vault_pass" \
+      || return 1
+    gum spin --title "Preparing vault-public partition..." \
+      -- bash -c "__prepare_vault_public_partition $selected_block_device" \
+      || return 1
+    log_info "Vault created on $selected_block_device"
+    show_vault_info
+  fi
+}
+
+function save_identity_to_vault {
+  # Sync keys to the vault
+  # This exports the secret keys to the vault
+  # and also exports the public key to the public vault
+  local cert_pass keyid pubkey_output
+
+  check_identity || return 1
+  check_vault_mounted || return 1
+
+  log_info "Saving PGP identity to vault..."
+
+  cert_pass=$(ask_secret_once "Cert password")
+  keyid=$(gpg -k --with-colons "$PRIMARY_UID" | awk -F: '/^pub:/ { print $5; exit }')
+
+  {
+    echo "$cert_pass" | gpg --output "$SECRET_VAULT_MOUNT/$keyid-Certify.key" \
+        --batch --pinentry-mode=loopback --passphrase-fd 0 \
+        --armor --export-secret-keys "$keyid" \
+        || return 1
+
+    echo "$cert_pass" | gpg --output "$SECRET_VAULT_MOUNT/$keyid-Subkeys.key" \
+        --batch --pinentry-mode=loopback --passphrase-fd 0 \
+        --armor --export-secret-subkeys "$keyid" \
+        || return 1
+
+    pubkey_output="$PUBLIC_VAULT_MOUNT/$keyid-$(date +%F).asc" 
+    gpg --output "$pubkey_output" --armor --export "$keyid" \
+        || return 1
+    # Add read rights to everybody for the vault exported public key
+    chmod o+r "$pubkey_output"
+
+  } &>> "$LOGFILE"
+
+  log_info "PGP Identity saved to vault"
+}
+
+function reset_yk_openpgp {
+  # Reset all OpenPGP information on YubiKey (keys, pins...)
+  local confirm_message
+  check_yubikey || return 1
+  confirm_message="This action will wipe all OpenPGP data on your YubiKey, and set all PINs to their default values. Continue?"
+  if gum confirm --default "$confirm_message"; then
+    {
+      ykman openpgp reset --force \
+        || return 1
+      ykman openpgp access set-retries 5 5 5 -f -a $YK_DEFAULT_ADMIN_PIN \
+        || return 1
+    } &>> "$LOGFILE"
+  fi
+  log_info "YubiKey OpenPGP reset"
+}
+
+function enable_kdf {
+  check_yubikey_access || return 1
+  if ! gpg --card-status | grep "KDF setting"; then
+    log_error "KDF is not supported by this YubiKey version."
+    return 1
+  fi
+  local confirm_message commands
+  confirm_message="Is YubiKey OpenPGP reset to factory defaults?"
+  if gum confirm --default "$confirm_message"; then
+    {
+      commands="admin\nkdf-setup\n$YK_DEFAULT_ADMIN_PIN\nquit\n"
+      echo "$commands" | gpg --batch --command-fd=0 \
+        --pinentry-mode=loopback --edit-card \
+        || return 1
+    } &>> "$LOGFILE"
+  else
+    log_error "KDF can be only enabled on a factory reset YubiKey."
+    return 1
+  fi
+}
+
+function configure_yk_touch {
+  # Require touch for YubiKey OpenPGP Operations
+  GUM_CHOOSE_HEADER="Choose touch option:"
+  options=( \
+    "No touch required:off" \
+    "Touch required:on" \
+    "Touch required, can't be disabled without deleting the private key:fixed" \
+    "Touch required, cached for 15s after use:cached" \
+    "Touch required, cached for 15s after use, can't be disabled without deleting the private key:cached-fixed" \
+  )
+  selected_op=$(gum choose --ordered --label-delimiter=":" "${options[@]}")
+  log_info "Configuring encryption key touch..."
+  ykman openpgp keys set-touch dec "$selected_op" \
+    || return 1
+  log_info "Configuring signature key touch..."
+  ykman openpgp keys set-touch sig "$selected_op" \
+    || return 1
+  log_info "Configuring authentication key touch..."
+  ykman openpgp keys set-touch aut "$selected_op" \
+    || return 1
+  log_info "Touch for YubiKey OpenPGP operations configured."
+}
+
+function change_yk_admin_pin {
+  local admin_pin new_admin_pin
+  check_yubikey || return 1
+  admin_pin="$YK_DEFAULT_ADMIN_PIN"
+  gum confirm --default "Has default admin PIN?" \
+    || admin_pin=$(ask_secret_once "Old admin PIN")
+  new_admin_pin=$(ask_secret "New admin PIN")
+  ykman openpgp access change-admin-pin -a "$admin_pin" -n "$new_admin_pin" \
+    || return 1
+} 
+
+function change_yk_user_pin {
+  # Change YubiKey user PIN
+  local user_pin new_user_pin
+  check_yubikey || return 1
+  user_pin="$YK_DEFAULT_USER_PIN"
+  gum confirm --default "Has default user PIN?" \
+    || user_pin=$(ask_secret_once "Old user PIN")
+  new_user_pin=$(ask_secret "New User PIN")
+  ykman openpgp access change-pin -P "$user_pin" -n "$new_user_pin" \
+    || return 1
+}
+
+#function set_smartcard_attributes {
+  #local cardholder_fn cardholder_sn login admin_pin
+  #cardholder_fn=$(gum input --prompt "Cardholder firstname: ")
+  #cardholder_sn=$(gum input --prompt "Cardholder surname: ")
+  #login=$(gum input --prompt "Login: ")
+  #admin_pin=$(ask_secret_once "YubiKey Admin PIN")
+  ## Set cardholder name
+  #{ 
+    #commands="admin\nname\n$cardholder_sn\n$cardholder_fn\n$admin_pin\nquit"
+    #echo -e "$commands" | gpg --batch --command-fd=0 --pinentry-mode=loopback \
+      #--edit-card  || return 1
+    ## Set login
+    #commands="admin\nlogin\n$login\n$admin_pin\nquit"
+    #echo -e "$commands" | gpg --batch --command-fd=0 --pinentry-mode=loopback \
+      #--edit-card  || return 1
+  #} &>> "$LOGFILE"
+#}
+
+function __set_card_login {
+  # Set $PRIMARY_UID as smartcard login attribute
+  # This is done to prevent the following issue:
+  # https://github.com/drduh/YubiKey-Guide/issues/461
+  # This is a helper function for transfer_subkeys_to_card operation
+  local admin_pin=$1
+  commands="admin\nlogin\n$PRIMARY_UID\n$admin_pin\nquit"
+  { 
+    log_info "Setting card login to $PRIMARY_UID..."
+    echo -e "$commands" | gpg --batch --command-fd=0 \
+      --pinentry-mode=loopback --edit-card \
+      || return 1
+  } &>> "$LOGFILE"
+}
+
+function __should_overwrite_slot {
+  # When a card slot is not empty, the user is asked if they want to overwrite it
+  # and needs to confirm by typing 'y' and pressing enter.
+  # This is a helper function for transfer_subkeys_to_card operation
+  local fpr_column slot_num
+  slot_num=$1
+  ((fpr_column=slot_num+1))
+  slot_fpr=$(gpg --with-colons --card-status \
+    | awk -F: "/^fpr:/ { print \$$fpr_column; }")
+  output=""
+  [[ -n "$slot_fpr" ]] && output="y\n"
+  echo "$output"
+}
+
+function transfer_subkeys_to_card {
+  local admin_pin cert_pass confirm_message commands sig_id enc_id aut_id 
+
+  if ! (check_yubikey && check_yubikey_access); then
+    log_error "Yubikey not detected or not accessible..."
+    return 1
+  fi
+
+  confirm_message="This action will wipe out keys present on the card. Continue?"
+  if gum confirm --default "$confirm_message"; then
+    admin_pin=$(ask_secret_once "YubiKey Admin PIN")
+    cert_pass=$(ask_secret_once "Cert pass")
+
+    # See https://github.com/drduh/YubiKey-Guide/issues/461
+    __set_card_login "$admin_pin" || return 1
+    
+    # Find key ids of current active subkeys
+    # When there are multiple revoked subkeys within this PGP Identity
+    # the key ids of currently active may be different (than 1, 2, 3)
+    subkeys=$(gpg --list-secret-keys --with-colon "$PRIMARY_UID" | grep "ssb" | nl)
+    sig_id=$(echo "$subkeys" | grep "ssb:u:.*::s::" | cut -f1)
+    enc_id=$(echo "$subkeys" | grep "ssb:u:.*::e::" | cut -f1)
+    aut_id=$(echo "$subkeys" | grep "ssb:u:.*::a::" | cut -f1)
+
+    log_info "Transferring subkeys to card..."
+    {
+      # Transfer signature key (1)
+      confirm=$(__should_overwrite_slot 1)
+      commands="key $sig_id\nkeytocard\n1\n${confirm}$cert_pass\n$admin_pin\nsave" 
+      echo -e "$commands" | gpg --batch --yes --command-fd=0 \
+        --pinentry-mode=loopback --edit-key "$PRIMARY_UID" \
+        || return 1
+      
+      # Transfer encryption key (2)
+      confirm=$(__should_overwrite_slot 2)
+      commands="key $enc_id\nkeytocard\n2\n${confirm}$cert_pass\n$admin_pin\nsave" 
+      echo -e "$commands" | gpg --batch --yes --command-fd=0 \
+        --pinentry-mode=loopback --edit-key "$PRIMARY_UID" \
+        || return 1
+
+      # Transfer authentication key (3)
+      confirm=$(__should_overwrite_slot 3)
+      commands="key $aut_id\nkeytocard\n3\n${confirm}$cert_pass\n$admin_pin\nsave" 
+      echo -e "$commands" | gpg --batch --yes --command-fd=0 \
+        --pinentry-mode=loopback --edit-key "$PRIMARY_UID" \
+        || return 1
+    } &>> "$LOGFILE"
+    #show_identity
+    #message="Subkeys transferred to card. The '>' (ssb>) symbol indicates the key is on the card. Don't forget to sync the public key to the vault."
+    #log_info "$message"
+    log_info "Subkeys transferred to card."
+  fi
+}
+
+function parse_gpg_identity {
+  # Parse gpg -K output (primary uid, additional uids, keypair id, subkeys)
+  # Parsed information is then used for the info header.
+  local sig_ssb_id="" sig_app_id="" sig_card_sn="" sig="" \
+    enc_ssb_id="" enc_app_id="" enc_card_sn="" enc="" \
+    aut_ssb_id="" aut_app_id="" aut_card_sn="" aut="" \
+    gpg_identity=""
+  {
+    OTHER_UIDS=""
+    KEYID=""
+    if [[ -n $PRIMARY_UID ]]; then
+      gpg_identity="$(gpg -K --with-colons "$PRIMARY_UID")"
+      OTHER_UIDS="$(echo "$gpg_identity" \
+        | awk -F: '/^uid:/ { print $10 }' \
+        | tail -n +2 \
+        | awk '{ printf "\n  - %s", $0 }' \
+      )"
+      KEYID="$(echo "$gpg_identity" \
+        | awk -F: '/^sec:u/ { print $5; exit }')"
+      sig_ssb_id="$(echo "$gpg_identity" \
+        | awk -F: '/^ssb:u:.*:s:/ { print $5; exit }')"
+      sig_app_id="$(echo "$gpg_identity" \
+        | awk -F: '/^ssb:u:.*:s:/ { print $15; exit }')"
+      sig_card_sn="${sig_app_id:20:8}"
+      enc_ssb_id="$(echo "$gpg_identity" \
+        | awk -F: '/^ssb:u:.*:e:/ { print $5; exit }')"
+      enc_app_id="$(echo "$gpg_identity" \
+        | awk -F: '/^ssb:u:.*:e:/ { print $15; exit }')"
+      enc_card_sn="${enc_app_id:20:8}"
+      aut_ssb_id="$(echo "$gpg_identity" \
+        | awk -F: '/^ssb:u:.*:a:/ { print $5; exit }')"
+      aut_app_id="$(echo "$gpg_identity" \
+        | awk -F: '/^ssb:u:.*:a:/ { print $15; exit }')"
+      aut_card_sn="${aut_app_id:20:8}"
+    fi
+    sig="${sig_ssb_id:-None} (Card: ${sig_card_sn:-None})"
+    enc="${enc_ssb_id:-None} (Card: ${enc_card_sn:-None})"
+    aut="${aut_ssb_id:-None} (Card: ${aut_card_sn:-None})"
+    SUBKEYS="
+    sig: $sig
+    enc: $enc
+    aut: $aut
+    "
+  } &>> "$LOGFILE" 
+}
+
+function add_uid {
+  # Add uid to an existing OpenPGP Identity
+  check_identity || return 1
+  local new_uid cert_pass
+  new_uid=$(gum input --prompt "Add UID (fullname <email>): ")
+  cert_pass=$(ask_secret_once "Cert password")
+  {
+    echo "$cert_pass" | gpg --batch --passphrase-fd 0 \
+      --pinentry-mode=loopback --quick-add-uid "$PRIMARY_UID" "$new_uid" \
+      || return 1
+  } &>> "$LOGFILE"
+  log_info "New UID ($new_uid) added to the PGP Identity."
+}
+
+function generate_identity {
+  # Generate OpenPGP identity 
+  # i.e. one master key, pubkey and three subkeys for signing,
+  # encryption and authentication. 
+  local keyfp cert_pass subkey_type primary_uid
+  primary_uid=$(gum input --prompt "User identity (fullname <email>): ")
+  cert_pass=$(ask_secret "Create cert password")
+  log_info "Generating PGP identity for $primary_uid..."
+  {
+    echo "$cert_pass" | gpg --batch --passphrase-fd 0 \
+      --quick-generate-key "$primary_uid" "$KEY_TYPE" cert never \
+      || return 1
+    keyfp=$(gpg -k --with-colons "$primary_uid" | awk -F: '/^fpr:/ { print $10; exit }')
+    for subkey_type in sign encrypt auth ; do \
+      echo "$cert_pass" | gpg --batch --pinentry-mode=loopback --passphrase-fd 0 \
+          --quick-add-key "$keyfp" "$KEY_TYPE" "$subkey_type" "$SUBKEY_EXPIRATION" \
+          || return 1
+    done
+    commands="uid 1\nprimary\n$cert_pass\nsave\n" 
+    echo -e "$commands" | gpg --batch --command-fd=0  \
+      --pinentry-mode=loopback --edit-key "$primary_uid"
+  } &>> "$LOGFILE" 
+  PRIMARY_UID="$primary_uid"
+  log_info "PGP identity generated."
+}
+
+function change_identity {
+  # Forget current selected identity
+  check_identity || return 0
+  PRIMARY_UID=""
+}
+
+function select_identity {
+  # Select OpenPGP Identity (represented by a primary UID) from 
+  # the list of available OpenPGP Identities in GNUPGHOME.
+  local primary_uids selected_uid
+  primary_uids=$(gpg --list-secret-keys --with-colon \
+    | awk -F: '/^sec:u:/ { print $5 }' \
+    | xargs -I {} sh -c 'gpg --list-secret-keys --with-colon {} | grep uid | head -n1 | cut -d: -f 10'
+  )
+  GUM_CHOOSE_HEADER="Choose identity:"
+  selected_uid=$(echo "$primary_uids" | gum choose)
+  if [[ -n "$selected_uid" ]]; then
+    PRIMARY_UID="$selected_uid"
+    log_info "Identity selected: $PRIMARY_UID"
+  else
+    log_error "No identity selected..."
+    return 1
+  fi
+}
+
+function revoke_subkeys {
+  # Revoke current active subkeys of the OpenPGP Identity
+  local reason cert_pass sig_id enc_id aut_id commands
+  reason=$(gum input --prompt "Give revocation reason: ")
+  cert_pass=$(ask_secret_once Cert pass)
+
+  # Find key ids of current active subkeys
+  subkeys=$(gpg --list-secret-keys --with-colon "$PRIMARY_UID" | grep "ssb" | nl)
+  sig_id=$(echo "$subkeys" | grep "ssb:u:.*::s::" | cut -f1)
+  enc_id=$(echo "$subkeys" | grep "ssb:u:.*::e::" | cut -f1)
+  aut_id=$(echo "$subkeys" | grep "ssb:u:.*::a::" | cut -f1)
+
+  log_info "Revoking subkeys: $sig_id (sig), $enc_id (enc), $aut_id (aut)..."
+  commands="key $sig_id\nkey $enc_id\nkey $aut_id\nrevkey\ny\n0\n$reason\n\ny\n$cert_pass\nsave\n"
+  {
+  echo -e "$commands" | gpg --batch --command-fd=0 --pinentry-mode=loopback \
+    --edit-key "$PRIMARY_UID" || return 1
+  } &>> "$LOGFILE"
+  show_identity
+  log_info "Subkeys revoked."
+}
+
+function generate_subkeys {
+  # Generate new subkeys (if they don't already exists) for the OpenPGP
+  # Identity
+  local cert_pass keyfpr subkey
+
+  # Find if there are any subkeys already
+  subkeys=$(gpg --list-secret-keys --with-colon "$PRIMARY_UID" | grep "ssb" | nl)
+  sig_id=$(echo "$subkeys" | grep "ssb:u:.*::s::" | cut -f1)
+  enc_id=$(echo "$subkeys" | grep "ssb:u:.*::e::" | cut -f1)
+  aut_id=$(echo "$subkeys" | grep "ssb:u:.*::a::" | cut -f1)
+  if [[ -n "$sig_id" || -n "$enc_id" || -n "$aut_id" ]]; then
+    log_error "Subkeys already exist... Revoke them before generating new ones."
+    return 1
+  fi
+
+  cert_pass=$(ask_secret_once Cert pass)
+  keyfpr=$(gpg -k --with-colons "$PRIMARY_UID" | awk -F: '/^fpr:/ { print $10; exit }')
+  log_info "Generating subkeys for $PRIMARY_UID..."
+  {
+    for subkey in sign encrypt auth ; do \
+      echo "$cert_pass" | gpg --batch --pinentry-mode=loopback --passphrase-fd 0 \
+          --quick-add-key "$keyfpr" "$KEY_TYPE" "$subkey" "$SUBKEY_EXPIRATION" \
+          || return 1
+    done
+  } &>> "$LOGFILE"
+  log_info "Subkeys generated."
+}
+
+function load_public_identity_from_vault {
+  # Import pubkey of an OpenPGP Identity from the mounted vault-public 
+  # partition. Intended for user mode
+  check_vault_mounted || return 1
+  available_fprs=$(basename -a "$PUBLIC_VAULT_MOUNT/"*????-??-??.asc \
+    | cut -d"-" -f1 \
+    | sort -u 
+  )
+  GUM_CHOOSE_HEADER="Choose fingerprint:"
+  selected_fpr=$(echo "$available_fprs" | gum choose)
+  pubkey=$(basename -a "${PUBLIC_VAULT_MOUNT}/"*"${selected_fpr}"*.asc | sort -r | head -n1)
+  { 
+    gpg --import "$PUBLIC_VAULT_MOUNT/$pubkey" || return 1
+    PRIMARY_UID=$(gpg --with-colons --fingerprint "$selected_fpr" \
+      | grep '^uid' \
+      | awk -F: '{print $10}' \
+      | head -n1
+    )
+    log_info "Setting ultimate trust for $PRIMARY_UID..."
+    commands="trust\n5\ny\nsave\n" 
+    echo -e "$commands" | gpg --batch --command-fd=0  \
+      --pinentry-mode=loopback --edit-key "$PRIMARY_UID" \
+      || return 1
+  } &>> "$LOGFILE"
+  log_info "PGP Identity for $PRIMARY_UID loaded from vault."
+  show_identity
+}
+
+function load_secret_identity_from_vault {
+  # Import secret keys (cert, subkeys) from the mounted vault-secret partition
+  # and also import pubkey from the mounted vault-public partition.
+  local available_fprs cert subkeys pubkey selected_fpr commands
+  check_vault_mounted || return 1
+  available_fprs=$(basename -a "$SECRET_VAULT_MOUNT/"*Certify.key | cut -d"-" -f1)
+  GUM_CHOOSE_HEADER="Choose fingerprint:"
+  selected_fpr=$(gum choose $available_fprs)
+  cert=$(basename -a "${SECRET_VAULT_MOUNT}/"*"${selected_fpr}-Certify.key")
+  subkeys=$(basename -a "${SECRET_VAULT_MOUNT}/"*"${selected_fpr}-Subkeys.key")
+  # There may be multiple versions of the pubkey, take the latest one
+  pubkey=$(basename -a "${PUBLIC_VAULT_MOUNT}/"*"${selected_fpr}"*.asc | sort -r | head -n1)
+  if [[ -z $pubkey ]]; then
+    # TODO Check pubkey exists
+    log_info "Unable to detect pubkey for $selected_fpr..."
+  fi
+  cert_pass=$(ask_secret_once "Cert pass")
+  { 
+    log_info "Importing cert key ($SECRET_VAULT_MOUNT/$cert)..."
+    echo "$cert_pass" | gpg --batch --pinentry-mode=loopback --passphrase-fd 0 \
+      --import "$SECRET_VAULT_MOUNT/$cert"
+    log_info "Importing subkeys ($SECRET_VAULT_MOUNT/$subkeys)..."
+    echo "$cert_pass" | gpg --batch --pinentry-mode=loopback --passphrase-fd 0 \
+      --import "$SECRET_VAULT_MOUNT/$subkeys"
+    log_info "Importing pubkey ($PUBLIC_VAULT_MOUNT/$pubkey)..."
+    gpg --import "$PUBLIC_VAULT_MOUNT/$pubkey"
+    # Set to ultimate trust
+    PRIMARY_UID=$(gpg --with-colons --fingerprint "$selected_fpr" \
+      | grep '^uid' \
+      | awk -F: '{print $10}' \
+      | head -n1
+    )
+    log_info "Setting ultimate trust for $PRIMARY_UID..."
+    commands="trust\n5\ny\nsave\n" 
+    echo -e "$commands" | gpg --batch --command-fd=0  \
+      --pinentry-mode=loopback --edit-key "$PRIMARY_UID"
+  } &>> "$LOGFILE"
+  log_info "PGP Identity for $PRIMARY_UID loaded from vault."
+  show_identity
+}
+
+function edit_identity {
+  # Enter GPG repl for key editing
+  gpg --edit-key "$PRIMARY_UID"
+}
+
+function edit_card {
+  # Enter GPG repl for card editing
+  gpg --edit-card 
+}
+
+function kill_gpg_agents {
+  # Kill running gpg agents
+  killall gpg-agent &>> /dev/null
+}
+
+function show_identity {
+  gpg -K "$PRIMARY_UID"
+}
+
+function show_card {
+  gpg --card-status
+}
+
+function encrypt_message {
+  local recipient message 
+  GUM_CHOOSE_HEADER="Choose recipient:"
+  recipient=$(gpg --list-keys --with-colons \
+    | grep '^uid' \
+    | cut -d: -f10 \
+    | gum choose \
+  )
+  message=$(gum write --placeholder "Type your secret message...")
+  if gum confirm --default "Save to file?"; then
+    echo "$message" | gpg --encrypt --armor \
+      --recipient "$recipient" > "/tmp/message.$(date +%s).enc" \
+      || return 1
+    log_info "Encrypted message saved to /tmp/message.$(date +%s).enc"
+  else
+    echo "$message" | gpg --encrypt --armor \
+      --recipient "$recipient" | less \
+      || return 1
+    log_info "Message encrypted and displayed"
+  fi
+}
+
+function encrypt_file {
+  local recipient file file_basename output
+  GUM_CHOOSE_HEADER="Choose recipient:"
+  recipient=$(gpg --list-keys --with-colons | grep '^uid' | cut -d: -f10 | gum choose)
+  GUM_FILE_HEADER="Choose file to encrypt"
+  file=$(gum file -a --height=10 "$HOME")
+  file_basename=$(basename "$file")
+  output="/tmp/${file_basename}".$(date +%s).enc
+  gpg --armor --recipient "$recipient" --output "$output" --encrypt "$file" \
+    || return 1
+  log_info "Encrypted $file saved to $output"
+}
+
+function decrypt_message {
+  if gum confirm --default "Read from file?"; then
+    GUM_FILE_HEADER="Choose file containing encrypted message"
+    file=$(gum file -a --height=10 ~)
+    gpg --decrypt "$file" | less \
+      || return 1
+    log_info "Message from $file decrypted and displayed."
+  else
+    gum write --char-limit 0 --placeholder "Paste your encrypted message..." \
+      | gpg --decrypt | less \
+      || return 1
+    log_info "Message decrypted and displayed."
+  fi
+}
+
+function decrypt_file {
+  local file file_basename
+  GUM_FILE_HEADER="Choose file to decrypt"
+  file=$(gum file -a --height=10 ~)
+  file_basename=$(basename "$file")
+  gpg --decrypt --output "/tmp/$file_basename.dec" "$file" \
+    || return 1
+  log_info "Decrypted $file saved to /tmp/$file_basename.dec"
+}
+
+function sign_file {
+  local file file_basename
+  GUM_FILE_HEADER="Choose file to sign"
+  file=$(gum file -a --height=10 ~)
+  file_basename=$(basename "$file")
+  if gum confirm --default "Detached signature?" ; then
+    gpg --armor --output "/tmp/$file_basename.sig" --detach-sign "$file" \
+      || return 1
+    log_info "Signature saved to /tmp/$file_basename.sig"
+  else
+    gpg --output "/tmp/$file_basename.signed" --sign "$file" \
+      || return 1
+    log_info "Signed file saved to /tmp/$file_basename.signed"
+  fi
+}
+
+function verify {
+  local file signature
+  if gum confirm --default "Is detached signature?"; then
+    GUM_FILE_HEADER="Choose data file"
+    file=$(gum file -a --height=10 ~)
+    GUM_FILE_HEADER="Choose signature file"
+    signature=$(gum file -a --height=10 ~)
+    gpg --verify "$signature" "$file" \
+      || return 1
+  else
+    GUM_FILE_HEADER="Choose signed file"
+    file=$(gum file -a --height=10 ~)
+    gpg --verify "$file" \
+      || return 1
+  fi
+}
+
+function load_contacts_from_vault {
+  check_vault_mounted || return 1
+  [[ -f "$PUBLIC_VAULT_MOUNT/contacts.asc" ]] || return 1
+  gpg --import "$PUBLIC_VAULT_MOUNT/contacts.asc"
+  log_info "Contacts imported"
+}
+
+function save_contacts_to_vault {
+  check_vault_mounted || return 1
+  gpg --output "$PUBLIC_VAULT_MOUNT/contacts.asc" --armor --export
+  log_info "Contacts saved to vault"
+}
+
+function refresh_contacts {
+  gpg --refresh-keys
+  log_info "Contacts refreshed"
+}
+
+function show_contacts {
+  gpg --list-keys --with-colon | awk -F: '/^uid/ { print $10 }'
+}
+
+function exit_cryptsane {
+  log_info "Exiting cryptsane..."
+  umount_vault
+  kill_gpg_agents
+  remove_tmp_gnupg_home
+  log_info "Bye bye!"
+  exit 0
+}
+
+
+MAIN_MENU="PGP VAULT CRYPT YUBIKEY CONTACTS LOGS EXIT"
+
+declare -A YK_OPS PGP_OPS PGP_NOID_OPS VAULT_OPS CRYPT_OPS CONTACT_OPS
+
+YK_OPS[private]="
+1. Change OpenPGP admin PIN:change_yk_admin_pin
+2. Change OpenPGP user PIN:change_yk_user_pin
+3. Reset OpenPGP data:reset_yk_openpgp
+4. Configure OpenPGP touch:configure_yk_touch
+5. Enable OpenPGP KDF:enable_kdf
+6. Show OpenPGP info:yk_info
+7. Back:back
+"
+
+YK_OPS[user]="
+1. Show YubiKey info:yk_info
+2. Back:back
+"
+
+PGP_NOID_OPS[private]="
+1. Generate PGP identity:generate_identity
+2. Import PGP identity from vault:load_secret_identity_from_vault
+8. [GPG repl] edit smartcard:edit_card
+5. Back:back
+"
+PGP_NOID_OPS[user]="
+1. Select PGP identity:select_identity
+2. Import PGP identity from vault:load_public_identity_from_vault
+3. Show smartcard:show_card
+4. Back:back
+"
+
+PGP_OPS[private]="
+1. Change PGP identity:change_identity
+2. Export PGP identity to vault:save_identity_to_vault
+3. Add user identity:add_uid
+4. Generate subkeys:generate_subkeys
+5. Revoke subkeys:revoke_subkeys
+6. Move subkeys to smartcard (YubiKey):transfer_subkeys_to_card
+7. [GPG repl] edit identity:edit_identity
+8. [GPG repl] edit smartcard:edit_card
+9. Back:back
+"
+
+PGP_OPS[user]="
+1. Change PGP identity:change_identity
+2. Show identity:show_identity
+3. Show smartcard:show_card
+4. Back:back
+"
+
+VAULT_OPS[private]="
+1. Create vault:create_vault
+2. Mount vault:mount_vault
+3. Unmount vault:umount_vault
+4. Back:back
+"
+
+VAULT_OPS[user]="
+1. Mount vault:mount_vault
+2. Unmount vault:umount_vault
+3. Back:back
+"
+
+CRYPT_OPS[private]="
+1. Encrypt message:encrypt_message
+2. Encrypt file:encrypt_file
+3. Decrypt message:decrypt_message
+4. Decrypt file:decrypt_file
+5. Sign file:sign_file
+6. Verify signature:verify
+7. Back:back
+"
+CRYPT_OPS[user]="${CRYPT_OPS[private]}"
+
+CONTACT_OPS[private]="
+1. Show contacts:show_contacts
+2. Refresh contacts:refresh_contacts
+3. Import contacts from vault:load_contacts_from_vault
+4. Export contacts to vault:save_contacts_to_vault
+5. Back:back
+"
+CONTACT_OPS[user]="${CONTACT_OPS[private]}"
+
+function submenu {
+  local selected_operation submenu_type submenu
+  submenu_type=$1
+  submenu=$2
+  while true; do
+    gum_menu_header "$submenu_type operations:"
+    selected_operation=$(echo "$submenu" | gum choose --height 20 --ordered --label-delimiter=":")
+    [[ "$selected_operation" = "back" ]] && return 0
+    $selected_operation || log_error "Operation $selected_operation failed. See logs for details."
+  done
+}
+
+function pgp_submenu {
+  while true; do
+    gum_menu_header "PGP operations:"
+    if [[ -z "$PRIMARY_UID" ]]; then
+      operations="${PGP_NOID_OPS[$CRYPTSANE_MODE]}"
+    else
+      operations="${PGP_OPS[$CRYPTSANE_MODE]}"
+    fi
+    selected_operation=$(echo "$operations" | gum choose --height 20 --ordered --label-delimiter=":")
+    [[ "$selected_operation" = "back" ]] && return 0
+    $selected_operation || log_error "Operation $selected_operation failed. See logs for details."
+  done
+}
+
+function set_mode {
+  if [[ ${CRYPTSANE_FLAGS[private]} != 0 ]]; then
+    # Check we have root privileges
+    if [[ $EUID -ne 0 ]]; then
+      log_error "Running in private mode requires root privileges..."
+      exit 1
+    fi
+    CRYPTSANE_MODE='private'
+    log_info "Running in private mode..."
+  else
+    CRYPTSANE_MODE='user'
+    log_info "Running in user mode..."
+  fi
+}
+
+function gum_menu_header {
+  # Render gum menu info header (box displaying info about OpenPGP Identity,
+  # Vault and YubiKey)
+  parse_gpg_identity
+  detect_yubikey
+  detect_vault_devices
+  local menu_name=$1 cryptsane_info
+  local -a openpgp_identity=(
+    "GPG home: ${GNUPGHOME}"
+    "Primary uid: ${PRIMARY_UID:-None}"
+    "Other uids: ${OTHER_UIDS:-None}"
+    "Keypair id: ${KEYID:-None}"
+    "Subkeys: ${SUBKEYS}"
+    "Mounted Vault: ${VAULT_DEVICE:-None} (Dir: ${VAULT_MOUNTDIR:-None})"
+    "Detected Vaults: ${DETECTED_VAULT_DEVICES:-None}"
+    "Detected YubiKey: ${YUBIKEY:-None} "
+  )
+  cryptsane_info=$(gum style \
+    --foreground 212 --border double \
+    --align left --width 50 --margin "1 2" --padding "0 1" \
+    "${openpgp_identity[@]}")
+  GUM_CHOOSE_HEADER=$(gum join --vertical "$cryptsane_info" "$menu_name")
+}
+
+function parse_args {
+  while (( $# > 0 )) ; do
+  case $1 in
+    -h|--help) show_cli_help; exit 0 ;;
+    -p|--private) (( CRYPTSANE_FLAGS[private]++ )) ;;
+    --) shift; break ;;
+    -*) printf >&2 'Unknown option %s\n' "$1" ; show_cli_help ; exit 1 ;;
+    *) break ;;
+  esac
+  shift
+done
+}
+
+function main_menu {
+  local selected_submenu
+  while true; do
+    gum_menu_header "Main menu:"
+    selected_submenu=$(gum choose $MAIN_MENU)
+    case $selected_submenu in
+      "YUBIKEY") submenu "YUBIKEY" "${YK_OPS[$CRYPTSANE_MODE]}" ;;
+      "VAULT") submenu "VAULT" "${VAULT_OPS[$CRYPTSANE_MODE]}" ;;
+      "PGP") pgp_submenu ;;
+      "CRYPT") submenu "CRYPT" "${CRYPT_OPS[$CRYPTSANE_MODE]}" ;;
+      "CONTACTS") submenu "CONTACTS" "${CONTACT_OPS[$CRYPTSANE_MODE]}" ;;
+      "LOGS") show_logs ;;
+      "EXIT") exit_cryptsane ;;
+    esac
+  done
+}
+
+function cryptsane {
+  set_mode
+  init_gnupg_home
+  main_menu
+}
+
+# The following functions need to be exported to be visible for gum spin
+# (loading/progress indicator) that is spawning a new shell
+export -f __repartition_vault_device __prepare_vault_public_partition\
+  __prepare_vault_secret_partition init_gnupg_home generate_identity\
+  log_error log_info ask_secret ask_secret_once
+
+parse_args "$@"
+cryptsane

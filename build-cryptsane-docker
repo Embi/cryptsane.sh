@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+# https://github.com/Embi/cryptsane.sh/blob/main/build-cryptsane-docker
+# Copyright (c) 2025 Embi
+# Licensed under the MIT License.
+
+docker build . -t cryptsane
